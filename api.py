@@ -10,9 +10,18 @@ from contextlib import asynccontextmanager
 import asyncio
 import urllib.parse
 import socket
+import os
 from collections import deque
 from config import API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL_ID
 from utils import LOGGER
+
+HEROKU_APP_NAME = os.getenv("HEROKU_APP_NAME")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL")
+FLY_APP_NAME = os.getenv("FLY_APP_NAME")
+VERCEL_URL = os.getenv("VERCEL_URL")
+CUSTOM_DOMAIN = os.getenv("CUSTOM_DOMAIN")
 
 class Telegram:
     API_ID = API_ID
@@ -21,9 +30,9 @@ class Telegram:
     CHANNEL_ID = LOG_CHANNEL_ID
 
 class Server:
-    BASE_URL = "http://161.97.132.210:5000"
     BIND_ADDRESS = "0.0.0.0"
-    PORT = 5000
+    PORT = int(os.getenv("PORT", 5000))
+    BASE_URL = None
 
 templates = Jinja2Templates(directory="templates")
 
@@ -36,6 +45,20 @@ error_messages = {
     500: "Internal server error.",
     503: "Service temporarily unavailable.",
 }
+
+def get_base_url_from_request(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    host = request.headers.get("host")
+    
+    if forwarded_host:
+        scheme = forwarded_proto or "https"
+        return f"{scheme}://{forwarded_host}"
+    elif host:
+        scheme = "https" if forwarded_proto == "https" else "http"
+        return f"{scheme}://{host}"
+    else:
+        return Server.BASE_URL or f"http://localhost:{Server.PORT}"
 
 def abort(status_code: int = 500, description: str = None):
     raise HTTPException(status_code=status_code, detail=description or error_messages.get(status_code))
@@ -78,7 +101,6 @@ class FileToLinkAPI(TelegramClient):
         LOGGER.info("Creating Telethonian FileToLink Client From BOT_TOKEN")
         super().__init__(session_name, api_id, api_hash, connection_retries=-1, timeout=120, flood_sleep_threshold=0)
         self.bot_token = bot_token
-        self.base_url = Server.BASE_URL.rstrip('/')
         self.request_count = 0
         self.max_concurrent = 100
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -101,11 +123,52 @@ async def get_local_ip():
         s.close()
     return ip
 
+async def detect_base_url():
+    if CUSTOM_DOMAIN:
+        base_url = f"https://{CUSTOM_DOMAIN}" if not CUSTOM_DOMAIN.startswith("http") else CUSTOM_DOMAIN
+        LOGGER.info(f"Using CUSTOM_DOMAIN: {base_url}")
+        return base_url
+    
+    if HEROKU_APP_NAME:
+        base_url = f"https://{HEROKU_APP_NAME}.herokuapp.com"
+        LOGGER.info(f"Detected Heroku deployment: {base_url}")
+        return base_url
+    
+    if RENDER_EXTERNAL_URL:
+        base_url = RENDER_EXTERNAL_URL.rstrip('/')
+        LOGGER.info(f"Detected Render deployment: {base_url}")
+        return base_url
+    
+    if RAILWAY_PUBLIC_DOMAIN:
+        base_url = f"https://{RAILWAY_PUBLIC_DOMAIN}"
+        LOGGER.info(f"Detected Railway deployment (public domain): {base_url}")
+        return base_url
+    
+    if RAILWAY_STATIC_URL:
+        base_url = RAILWAY_STATIC_URL.rstrip('/')
+        LOGGER.info(f"Detected Railway deployment (static URL): {base_url}")
+        return base_url
+    
+    if FLY_APP_NAME:
+        base_url = f"https://{FLY_APP_NAME}.fly.dev"
+        LOGGER.info(f"Detected Fly.io deployment: {base_url}")
+        return base_url
+    
+    if VERCEL_URL:
+        base_url = f"https://{VERCEL_URL}"
+        LOGGER.info(f"Detected Vercel deployment: {base_url}")
+        return base_url
+    
+    ip = await get_local_ip()
+    base_url = f"http://{ip}:{Server.PORT}"
+    LOGGER.info(f"No platform detected, using local IP: {base_url}")
+    return base_url
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ip = await get_local_ip()
+    Server.BASE_URL = await detect_base_url()
     await api_instance.start_api()
-    LOGGER.info(f"API running, starting web server on {ip}:{Server.PORT}")
+    LOGGER.info(f"API running on: {Server.BASE_URL}")
     yield
     LOGGER.info("Shutting down API")
 
@@ -122,9 +185,9 @@ async def stream_file(file_id: int, request: Request):
         me = await api_instance.get_me()
         api_name = "@" + me.username
         LOGGER.info("Stream request - File ID: %s, Using API: %s", file_id, api_name)
-        
+
         file_task = asyncio.create_task(api_instance.get_messages(Telegram.CHANNEL_ID, ids=int(file_id)))
-        
+
         try:
             file = await asyncio.wait_for(file_task, timeout=10.0)
             if not file:
@@ -136,16 +199,16 @@ async def stream_file(file_id: int, request: Request):
         except Exception as e:
             LOGGER.error("Failed to retrieve message %s using API %s: %s", file_id, api_name, e)
             abort(500)
-        
+
         if code != file.raw_text:
             LOGGER.warning("Access denied - Invalid code for file %s: provided=%s, expected=%s", file_id, code, file.raw_text)
             abort(403)
-        
+
         file_name, file_size, mime_type = get_file_properties(file)
         LOGGER.info("File properties - Name: %s, Size: %s, Type: %s", file_name, file_size, mime_type)
-        
+
         quoted_code = urllib.parse.quote(code)
-        base_url = Server.BASE_URL.rstrip('/')
+        base_url = get_base_url_from_request(request)
         file_url = f"{base_url}/dl/{file_id}?code={quoted_code}"
         file_size_mb = f"{file_size / (1024 * 1024):.2f} MB"
 
@@ -160,18 +223,18 @@ async def stream_file(file_id: int, request: Request):
 @app.get("/dl/{file_id}")
 async def transmit_file(file_id: int, request: Request):
     code = request.query_params.get("code") or abort(401)
-    
+
     if code.endswith("=stream"):
         code_clean = code[:-7]
         quoted_code = urllib.parse.quote(code_clean)
-        base_url = Server.BASE_URL.rstrip('/')
+        base_url = get_base_url_from_request(request)
         async with api_instance.semaphore:
             me = await api_instance.get_me()
             api_name = "@" + me.username
             LOGGER.info("Stream request redirected from dl - File ID: %s, Using API: %s", file_id, api_name)
-            
+
             file_task = asyncio.create_task(api_instance.get_messages(Telegram.CHANNEL_ID, ids=int(file_id)))
-            
+
             try:
                 file = await asyncio.wait_for(file_task, timeout=10.0)
                 if not file:
@@ -183,14 +246,14 @@ async def transmit_file(file_id: int, request: Request):
             except Exception as e:
                 LOGGER.error("Failed to retrieve message %s using API %s: %s", file_id, api_name, e)
                 abort(500)
-            
+
             if code_clean != file.raw_text:
                 LOGGER.warning("Access denied - Invalid code for file %s: provided=%s, expected=%s", file_id, code_clean, file.raw_text)
                 abort(403)
-            
+
             file_name, file_size, mime_type = get_file_properties(file)
             LOGGER.info("File properties - Name: %s, Size: %s, Type: %s", file_name, file_size, mime_type)
-            
+
             file_url = f"{base_url}/dl/{file_id}?code={quoted_code}"
             file_size_mb = f"{file_size / (1024 * 1024):.2f} MB"
 
@@ -201,14 +264,14 @@ async def transmit_file(file_id: int, request: Request):
                 "file_url": file_url,
                 "mime_type": mime_type
             })
-    
+
     async with api_instance.semaphore:
         me = await api_instance.get_me()
         api_name = "@" + me.username
         LOGGER.info("File download request - File ID: %s, Using API: %s", file_id, api_name)
-        
+
         file_task = asyncio.create_task(api_instance.get_messages(Telegram.CHANNEL_ID, ids=int(file_id)))
-        
+
         try:
             file = await asyncio.wait_for(file_task, timeout=10.0)
             if not file:
@@ -220,14 +283,14 @@ async def transmit_file(file_id: int, request: Request):
         except Exception as e:
             LOGGER.error("Failed to retrieve message %s using API %s: %s", file_id, api_name, e)
             abort(500)
-        
+
         if code != file.raw_text:
             LOGGER.warning("Access denied - Invalid code for file %s: provided=%s, expected=%s", file_id, code, file.raw_text)
             abort(403)
-        
+
         file_name, file_size, mime_type = get_file_properties(file)
         LOGGER.info("File properties - Name: %s, Size: %s, Type: %s", file_name, file_size, mime_type)
-        
+
         range_header = request.headers.get("Range", "")
         if range_header:
             from_bytes, until_bytes = range_header.replace("bytes=", "").split("-")
@@ -238,11 +301,11 @@ async def transmit_file(file_id: int, request: Request):
             from_bytes = 0
             until_bytes = file_size - 1
             LOGGER.info("Full file request - Size: %s bytes", file_size)
-        
+
         if (until_bytes > file_size) or (from_bytes < 0) or (until_bytes < from_bytes):
             LOGGER.error("Invalid range request - Bytes: %s-%s/%s", from_bytes, until_bytes, file_size)
             abort(416, "Invalid range.")
-        
+
         chunk_size = 4 * 1024 * 1024  
         until_bytes = min(until_bytes, file_size - 1)
         offset = from_bytes - (from_bytes % chunk_size)
@@ -250,9 +313,9 @@ async def transmit_file(file_id: int, request: Request):
         last_part_cut = until_bytes % chunk_size + 1
         req_length = until_bytes - from_bytes + 1
         part_count = ceil(until_bytes / chunk_size) - floor(offset / chunk_size)
-        
+
         sanitized_filename = sanitize_filename(file_name)
-        
+
         headers = {
             "Content-Type": f"{mime_type}",
             "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
@@ -262,18 +325,18 @@ async def transmit_file(file_id: int, request: Request):
             "Cache-Control": "public, max-age=3600",
             "Connection": "keep-alive",
         }
-        
+
         LOGGER.info("Starting file download - API: %s, Chunks: %s, Chunk size: %s", api_name, part_count, chunk_size)
-        
+
         async def file_generator():
             current_part = 1
             prefetch_buffer = asyncio.Queue(maxsize=50)
             buffer_task = None
-            
+
             async def aggressive_prefetch():
                 chunk_tasks = deque()
                 max_parallel_chunks = 10
-                
+
                 async for chunk in api_instance.iter_download(
                     file,
                     offset=offset,
@@ -285,17 +348,17 @@ async def transmit_file(file_id: int, request: Request):
                     while len(chunk_tasks) >= max_parallel_chunks:
                         done_task = chunk_tasks.popleft()
                         await done_task
-                    
+
                     chunk_task = asyncio.create_task(prefetch_buffer.put(chunk))
                     chunk_tasks.append(chunk_task)
-                
+
                 for task in chunk_tasks:
                     await task
-                
+
                 await prefetch_buffer.put(None)
-            
+
             buffer_task = asyncio.create_task(aggressive_prefetch())
-            
+
             try:
                 while current_part <= part_count:
                     try:
@@ -303,10 +366,10 @@ async def transmit_file(file_id: int, request: Request):
                     except asyncio.TimeoutError:
                         LOGGER.warning("Prefetch timeout - retrying")
                         continue
-                    
+
                     if chunk is None:
                         break
-                    
+
                     if part_count == 1:
                         yield chunk[first_part_cut:last_part_cut]
                     elif current_part == 1:
@@ -315,9 +378,9 @@ async def transmit_file(file_id: int, request: Request):
                         yield chunk[:last_part_cut]
                     else:
                         yield chunk
-                    
+
                     current_part += 1
-                
+
                 LOGGER.info("File download completed successfully - File: %s, API: %s", file_name, api_name)
             except Exception as e:
                 LOGGER.error("Error during file download - File: %s, API: %s, Error: %s", file_name, api_name, e)
@@ -330,7 +393,7 @@ async def transmit_file(file_id: int, request: Request):
                     except asyncio.CancelledError:
                         pass
                 LOGGER.info("API %s processing completed", api_name)
-        
+
         return StreamingResponse(
             file_generator(), 
             headers=headers, 
